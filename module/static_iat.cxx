@@ -108,7 +108,7 @@ namespace
             h = h * factor + c;
         return h;
     }
-    auto lookup_api_set( const std::string& requested ) -> std::string
+    auto lookup_api_set( const std::string& requested, const std::string& importer = {} ) -> std::string
     {
         auto name = dll_basename( requested );
         if ( !is_api_set_name( name ) ) return {};
@@ -138,22 +138,65 @@ namespace
             {
                 auto name_off = get< std::uint32_t >( map, entry_off + i * 24ull + 4 );
                 auto hashed_len = get< std::uint32_t >( map, entry_off + i * 24ull + 12 );
-                if ( utf16_ascii( map, name_off, hashed_len ) == key ) { idx = static_cast< std::int32_t >( i ); break; }
+                try
+                {
+                    if ( utf16_ascii( map, name_off, hashed_len ) == key ) { idx = static_cast< std::int32_t >( i ); break; }
+                }
+                catch ( const std::exception& ) {}
             }
         }
         require( idx >= 0 && static_cast< std::uint32_t >( idx ) < count, ( "unknown API set " + requested ).c_str( ) );
         auto rec = entry_off + static_cast< std::uint64_t >( idx ) * 24;
-        auto name_off = get< std::uint32_t >( map, rec + 4 );
-        auto hashed_len = get< std::uint32_t >( map, rec + 12 );
-        require( utf16_ascii( map, name_off, hashed_len ) == key, ( "API set hash collision for " + requested ).c_str( ) );
         auto value_off = get< std::uint32_t >( map, rec + 16 );
         auto value_count = get< std::uint32_t >( map, rec + 20 );
         require( value_count && fits( map.size( ), value_off, value_count * 20ull ), "empty API set host list" );
-        auto host_off = get< std::uint32_t >( map, value_off + 12 );
-        auto host_len = get< std::uint32_t >( map, value_off + 16 );
-        auto host = utf16_ascii( map, host_off, host_len );
+        auto value_host = [ & ]( std::uint32_t i ) -> std::string
+        {
+            auto off = get< std::uint32_t >( map, value_off + i * 20ull + 12 );
+            auto len = get< std::uint32_t >( map, value_off + i * 20ull + 16 );
+            if ( !len ) return {};
+            auto host = utf16_ascii( map, off, len );
+            if ( !host.empty( ) && host.find( '.' ) == std::string::npos ) host += ".dll";
+            return host;
+        };
+        auto host = value_host( 0 );
+        const auto parent = dll_basename( importer );
+        if ( !parent.empty( ) && value_count > 1 )
+        {
+            for ( std::uint32_t i = 1; i < value_count; ++i )
+            {
+                auto name_off = get< std::uint32_t >( map, value_off + i * 20ull + 4 );
+                auto name_len = get< std::uint32_t >( map, value_off + i * 20ull + 8 );
+                if ( !name_len ) continue;
+                try
+                {
+                    if ( dll_basename( utf16_ascii( map, name_off, name_len ) ) == parent )
+                    {
+                        auto mapped = value_host( i );
+                        if ( !mapped.empty( ) ) host = std::move( mapped );
+                        break;
+                    }
+                }
+                catch ( const std::exception& ) {}
+            }
+        }
+        if ( !parent.empty( ) && dll_basename( host ) == parent )
+        {
+            for ( std::uint32_t i = 0; i < value_count; ++i )
+            {
+                try
+                {
+                    auto mapped = value_host( i );
+                    if ( !mapped.empty( ) && dll_basename( mapped ) != parent )
+                    {
+                        host = std::move( mapped );
+                        break;
+                    }
+                }
+                catch ( const std::exception& ) {}
+            }
+        }
         require( !host.empty( ), "empty API set host" );
-        if ( host.find( '.' ) == std::string::npos ) host += ".dll";
         return host;
     }
     auto fallback_api_set_host( const std::string& requested ) -> std::string
@@ -165,7 +208,7 @@ namespace
         if ( name.find( "-ole32" ) != std::string::npos ) return "ole32.dll";
         return "kernelbase.dll";
     }
-    auto resolve_module_name( std::string name ) -> std::string
+    auto resolve_module_name( std::string name, std::string importer = {} ) -> std::string
     {
         name = lower( std::move( name ) );
         auto slash = name.find_last_of( "\\/" );
@@ -174,10 +217,13 @@ namespace
             "guest DLL path is not a basename" );
         if ( name.find( '.' ) == std::string::npos ) name += ".dll";
         if ( !is_api_set_name( name ) ) return name;
-        try { return lookup_api_set( name ); }
+        try { return lookup_api_set( name, importer ); }
         catch ( const std::exception& )
         {
-            return fallback_api_set_host( name );
+            auto host = fallback_api_set_host( name );
+            if ( dll_basename( host ) == dll_basename( importer ) && dll_basename( importer ) == "kernel32" )
+                return "kernelbase.dll";
+            return host;
         }
     }
     auto crc32_ieee( std::uint32_t crc, const std::uint8_t* p, std::size_t n ) -> std::uint32_t
@@ -395,11 +441,169 @@ namespace
             for ( const auto& kv : dlls ) if ( kv.second.base == base ) return kv.first;
             throw std::runtime_error( "unknown emulated DLL handle" );
         }
-        auto load( std::string name ) -> std::uint64_t
+        using ntstatus_t = LONG;
+        using nt_query5_fn = ntstatus_t ( NTAPI* )( HANDLE, ULONG, PVOID, ULONG, PULONG );
+        using nt_set4_fn = ntstatus_t ( NTAPI* )( HANDLE, ULONG, PVOID, ULONG );
+        auto host_ntdll( ) -> HMODULE
         {
-            name = resolve_module_name( std::move( name ) );
+            static auto m = GetModuleHandleW( L"ntdll.dll" );
+            require( m, "host ntdll is missing" );
+            return m;
+        }
+        auto host_proc( const char* name ) -> FARPROC
+        {
+            auto p = GetProcAddress( host_ntdll( ), name );
+            if ( !p && name[ 0 ] == 'N' && name[ 1 ] == 't' )
+            {
+                std::string zw = name;
+                zw[ 0 ] = 'Z'; zw[ 1 ] = 'w';
+                p = GetProcAddress( host_ntdll( ), zw.c_str( ) );
+            }
+            return p;
+        }
+        auto host_handle( std::uint64_t guest ) -> HANDLE
+        {
+            if ( guest == ~std::uint64_t( 0 ) || guest == 0 ) return GetCurrentProcess( );
+            if ( guest == ~std::uint64_t( 1 ) ) return GetCurrentThread( );
+            auto it = handles.find( guest );
+            if ( it != handles.end( ) && !it->second ) return GetCurrentProcess( );
+            return GetCurrentProcess( );
+        }
+        auto rewrite_host_pointers( bytes& buf ) -> void
+        {
+            std::uint64_t host_peb = 0, host_teb = 0;
+            PROCESS_BASIC_INFORMATION pbi{};
+            ULONG ret{};
+            using query_fn = LONG( WINAPI* )( HANDLE, ULONG, PVOID, ULONG, PULONG );
+            auto query = reinterpret_cast< query_fn >( host_proc( "NtQueryInformationProcess" ) );
+            if ( query && query( GetCurrentProcess( ), 0, &pbi, sizeof( pbi ), &ret ) == 0 )
+                host_peb = reinterpret_cast< std::uint64_t >( pbi.PebBaseAddress );
+            host_teb = reinterpret_cast< std::uint64_t >( NtCurrentTeb( ) );
+            for ( std::size_t i = 0; i + 8 <= buf.size( ); i += 8 )
+            {
+                std::uint64_t v{};
+                std::memcpy( &v, buf.data( ) + i, 8 );
+                if ( host_peb && v == host_peb ) v = peb;
+                else if ( host_teb && v >= ( host_teb & ~0xfffull ) && v < ( host_teb & ~0xfffull ) + 0x2000 )
+                    v = teb + ( v - host_teb );
+                else
+                    continue;
+                std::memcpy( buf.data( ) + i, &v, 8 );
+            }
+        }
+        auto query_information( const std::string& api, HANDLE object, ULONG cls, std::uint64_t buf, ULONG len, std::uint64_t retlen ) -> void
+        {
+            constexpr std::uint64_t success = 0;
+            constexpr std::uint64_t info_length_mismatch = 0xc0000004u;
+            constexpr std::uint64_t access_violation = 0xc0000005u;
+            constexpr std::uint64_t port_not_set = 0xc0000353u;
+            if ( retlen && !accessible( retlen, 4 ) ) { result( access_violation ); return; }
+            if ( api.find( "Process" ) != std::string::npos )
+            {
+                if ( cls == 7 || cls == 0x1e || cls == 0x1a )
+                {
+                    if ( len < 8 ) { if ( retlen ) w32( retlen, 8 ); result( info_length_mismatch ); return; }
+                    if ( !accessible( buf, 8 ) ) { result( access_violation ); return; }
+                    w64( buf, 0 );
+                    if ( retlen ) w32( retlen, 8 );
+                    result( cls == 0x1e ? port_not_set : success );
+                    return;
+                }
+                if ( cls == 0x1f || cls == 12 )
+                {
+                    if ( len < 4 ) { if ( retlen ) w32( retlen, 4 ); result( info_length_mismatch ); return; }
+                    if ( !accessible( buf, 4 ) ) { result( access_violation ); return; }
+                    w32( buf, 1 );
+                    if ( retlen ) w32( retlen, 4 );
+                    result( success );
+                    return;
+                }
+                if ( cls == 0 )
+                {
+                    if ( len < 48 ) { if ( retlen ) w32( retlen, 48 ); result( info_length_mismatch ); return; }
+                    if ( !accessible( buf, 48 ) ) { result( access_violation ); return; }
+                    zero( buf, 48 ); w64( buf + 8, peb ); w64( buf + 32, 0x1234 ); w64( buf + 40, 0x1111 );
+                    if ( retlen ) w32( retlen, 48 );
+                    result( success );
+                    return;
+                }
+            }
+            if ( api.find( "Thread" ) != std::string::npos )
+            {
+                if ( cls == 0x11 )
+                {
+                    if ( len < 1 ) { if ( retlen ) w32( retlen, 1 ); result( info_length_mismatch ); return; }
+                    if ( !accessible( buf, 1 ) ) { result( access_violation ); return; }
+                    write< std::uint8_t >( buf, hidden ? 1 : 0 );
+                    if ( retlen ) w32( retlen, 1 );
+                    result( success );
+                    return;
+                }
+                if ( cls == 0 )
+                {
+                    if ( len < 0x30 ) { if ( retlen ) w32( retlen, 0x30 ); result( info_length_mismatch ); return; }
+                    if ( !accessible( buf, 0x30 ) ) { result( access_violation ); return; }
+                    zero( buf, 0x30 );
+                    w32( buf, 0x103 );
+                    w64( buf + 8, teb );
+                    w64( buf + 0x10, 0x1234 );
+                    w64( buf + 0x18, 0x5678 );
+                    w64( buf + 0x20, 1 );
+                    if ( retlen ) w32( retlen, 0x30 );
+                    result( success );
+                    return;
+                }
+            }
+            auto fn = reinterpret_cast< nt_query5_fn >( host_proc( api.c_str( ) ) );
+            if ( !fn )
+            {
+                if ( len && accessible( buf, len ) ) zero( buf, len );
+                if ( retlen ) w32( retlen, len );
+                result( success );
+                return;
+            }
+            bytes scratch( len ? len : 1 );
+            ULONG written = 0;
+            auto status = fn( object, cls, scratch.data( ), len, &written );
+            if ( status == static_cast< ntstatus_t >( 0xC0000004 ) )
+            {
+                if ( retlen ) w32( retlen, written );
+                result( info_length_mismatch );
+                return;
+            }
+            if ( status >= 0 && len && accessible( buf, len ) )
+            {
+                rewrite_host_pointers( scratch );
+                check( uc_mem_write( vm.uc, buf, scratch.data( ), len ) );
+            }
+            if ( retlen ) w32( retlen, written ? written : len );
+            result( static_cast< std::uint64_t >( static_cast< std::uint32_t >( status ) ) );
+        }
+        auto set_information( const std::string& api, HANDLE object, ULONG cls, std::uint64_t buf, ULONG len ) -> void
+        {
+            constexpr std::uint64_t success = 0;
+            constexpr std::uint64_t info_length_mismatch = 0xc0000004u;
+            constexpr std::uint64_t invalid_handle = 0xc0000008u;
+            if ( api.find( "Thread" ) != std::string::npos && cls == 0x11 )
+            {
+                if ( len ) result( info_length_mismatch );
+                else if ( argument( 0 ) != ~std::uint64_t( 1 ) && argument( 0 ) != ~std::uint64_t( 0 ) ) result( invalid_handle );
+                else { hidden = true; result( success ); }
+                return;
+            }
+            auto fn = reinterpret_cast< nt_set4_fn >( host_proc( api.c_str( ) ) );
+            if ( !fn ) { result( success ); return; }
+            bytes scratch( len );
+            if ( len && accessible( buf, len ) )
+                check( uc_mem_read( vm.uc, buf, scratch.data( ), len ) );
+            auto status = fn( object, cls, len ? scratch.data( ) : nullptr, len );
+            result( static_cast< std::uint64_t >( static_cast< std::uint32_t >( status ) ) );
+        }
+        auto load( std::string name, std::string importer = {} ) -> std::uint64_t
+        {
+            name = resolve_module_name( std::move( name ), std::move( importer ) );
             auto old = dlls.find( name ); if ( old != dlls.end( ) ) return old->second.base;
-            require( dlls.size( ) < 64, "offline DLL limit exceeded" );
+            require( dlls.size( ) < 256, "offline DLL limit exceeded" );
             char sysdir[ MAX_PATH ]; require( GetSystemDirectoryA( sysdir, MAX_PATH ) < MAX_PATH, "cannot locate System32" );
             auto raw = read_file( std::string( sysdir ) + "\\" + name ); auto header = parse( raw );
             dll d{}; d.base = 0x180000000ull + dlls.size( ) * 0x2000000ull; d.image = mapped( raw, header ); d.exports = header.dirs[ 0 ];
@@ -439,17 +643,40 @@ namespace
                 result, result + stored.image.size( ) - 1 ) );
             std::printf( "offline: mapped %s\n", name.c_str( ) ); std::fflush( stdout ); return result;
         }
-        auto resolve( const std::string& name, const std::string& symbol, unsigned depth = 0 ) -> std::uint64_t
+        auto find_export_ordinal( const dll& d, const std::string& symbol ) -> std::uint32_t
         {
-            require( depth < 16, "export forwarder cycle" ); auto base = load( name ); auto& d = dlls.at( module_name( base ) );
-            std::uint32_t ordinal{};
-            if ( !symbol.empty( ) && symbol[ 0 ] == '#' ) ordinal = static_cast< std::uint32_t >( std::stoul( symbol.substr( 1 ) ) );
-            else { auto it = d.names.find( symbol ); require( it != d.names.end( ), ( "missing export " + name + "!" + symbol ).c_str( ) ); ordinal = it->second; }
+            if ( !symbol.empty( ) && symbol[ 0 ] == '#' )
+                return static_cast< std::uint32_t >( std::stoul( symbol.substr( 1 ) ) );
+            auto it = d.names.find( symbol );
+            if ( it != d.names.end( ) ) return it->second;
+            auto want = lower( symbol );
+            for ( const auto& kv : d.names )
+                if ( lower( kv.first ) == want ) return kv.second;
+            throw std::runtime_error( "missing export " + symbol );
+        }
+        auto resolve( const std::string& name, const std::string& symbol, unsigned depth = 0,
+            std::set< std::pair< std::string, std::string > >* seen = nullptr, const std::string& importer = {} ) -> std::uint64_t
+        {
+            require( depth < 32, "export forwarder cycle" );
+            std::set< std::pair< std::string, std::string > > local;
+            auto& visited = seen ? *seen : local;
+            auto base = load( name, importer );
+            auto host = module_name( base );
+            auto key = std::make_pair( host, lower( symbol ) );
+            require( visited.insert( key ).second, "export forwarder cycle" );
+            auto& d = dlls.at( host );
+            auto ordinal = find_export_ordinal( d, symbol );
             auto it = d.ordinals.find( ordinal ); require( it != d.ordinals.end( ), "missing export ordinal" ); auto rva = it->second;
             if ( rva >= d.exports.VirtualAddress && rva - d.exports.VirtualAddress < d.exports.Size )
             {
-                auto forward = string_at( d.image, rva ); auto dot = forward.rfind( '.' ); require( dot != std::string::npos, "invalid export forwarder" );
-                return resolve( forward.substr( 0, dot ), forward.substr( dot + 1 ), depth + 1 );
+                auto forward = string_at( d.image, rva );
+                auto dot = forward.rfind( '.' );
+                require( dot != std::string::npos && dot + 1 < forward.size( ), "invalid export forwarder" );
+                auto target_mod = forward.substr( 0, dot );
+                auto target_sym = forward.substr( dot + 1 );
+                if ( !target_sym.empty( ) && target_sym[ 0 ] == '#' )
+                    target_sym = "#" + std::to_string( std::stoul( target_sym.substr( 1 ) ) );
+                return resolve( target_mod, target_sym, depth + 1, &visited, host );
             }
             return base + rva;
         }
@@ -515,9 +742,16 @@ namespace
             try
             {
                 auto num = static_cast< std::uint32_t >( s.reg( UC_X86_REG_RAX ) ); auto it = s.syscalls.find( num );
-                require( it != s.syscalls.end( ), "unrecognized offline syscall" );
                 auto next = s.reg( UC_X86_REG_RIP ) + 2, flags = s.reg( UC_X86_REG_EFLAGS );
-                s.in_syscall = true; s.reg( UC_X86_REG_RCX, s.reg( UC_X86_REG_R10 ) ); s.dispatch( s.apis.at( it->second ).second );
+                s.in_syscall = true; s.reg( UC_X86_REG_RCX, s.reg( UC_X86_REG_R10 ) );
+                if ( it != s.syscalls.end( ) )
+                    s.dispatch( s.apis.at( it->second ).second );
+                else
+                {
+                    std::printf( "offline: unknown syscall 0x%x stubbed\n", num );
+                    std::fflush( stdout );
+                    s.result( 0 );
+                }
                 s.in_syscall = false; s.reg( UC_X86_REG_RCX, next ); s.reg( UC_X86_REG_R11, flags );
             }
             catch ( const std::exception& ex ) { s.failure = ex.what( ); uc_emu_stop( s.vm.uc ); }
@@ -568,19 +802,22 @@ namespace
             static_cast< unsigned long long >( a2 ), static_cast< unsigned long long >( a3 ) );
         std::fflush( stdout );
 
-        if ( n == "GetProcAddress" || n == "LdrGetProcedureAddress" )
+        if ( n == "GetProcAddress" || n == "GetProcAddressForCaller" ||
+            n == "LdrGetProcedureAddress" || n == "LdrGetProcedureAddressForCaller" )
         {
             const auto module = module_name( a0 );
+            const bool ldr = n.rfind( "LdrGetProcedureAddress", 0 ) == 0;
             std::string symbol;
-            if ( n == "GetProcAddress" )
+            if ( !ldr )
                 symbol = a1 <= 0xffff ? "#" + std::to_string( a1 ) : text( a1 );
             else
                 symbol = a1 ? text( read< std::uint64_t >( a1 + 8 ) ) : "#" + std::to_string( a2 );
             auto address = resolve( module, symbol );
-            if ( n == "LdrGetProcedureAddress" )
+            if ( ldr )
             {
-                require( accessible( a3, 8 ), "invalid LdrGetProcedureAddress result pointer" );
-                w64( a3, address ); address = success;
+                const auto out = n == "LdrGetProcedureAddressForCaller" ? argument( 4 ) : a3;
+                require( accessible( out, 8 ), "invalid LdrGetProcedureAddress result pointer" );
+                w64( out, address ); address = success;
             }
             result( address ); return;
         }
@@ -589,7 +826,7 @@ namespace
             const bool native = n == "LdrLoadDll";
             const bool wide = native || n == "LoadLibraryW" || n == "LoadLibraryExW";
             auto ptr = native ? read< std::uint64_t >( a2 + 8 ) : a0;
-            auto address = load( text( ptr, wide ) ); lists( );
+            auto address = load( text( ptr, wide ), "image.exe" ); lists( );
             if ( native )
             {
                 require( accessible( a3, 8 ), "invalid LdrLoadDll result pointer" );
@@ -680,9 +917,22 @@ namespace
             }
             result( success ); return;
         }
-        if ( n == "NtUnmapViewOfSection" || n == "NtClose" || n == "NtSetInformationProcess" || n == "NtDelayExecution" || n == "NtYieldExecution" )
+        if ( n == "NtUnmapViewOfSection" || n == "NtClose" || n == "NtDelayExecution" || n == "NtYieldExecution" )
         {
             result( success ); return;
+        }
+        if ( n == "NtQueryInformationProcess" || n == "NtQueryInformationThread" || n == "NtQueryInformationToken" ||
+            n == "NtQueryInformationJobObject" || n == "NtQueryInformationFile" || n == "NtQueryObject" ||
+            n == "NtQueryVirtualMemory" || n == "NtQuerySection" || n == "NtQueryInformationEnlistment" )
+        {
+            query_information( n, host_handle( a0 ), static_cast< ULONG >( a1 ), a2, static_cast< ULONG >( a3 ), argument( 4 ) );
+            return;
+        }
+        if ( n == "NtSetInformationProcess" || n == "NtSetInformationThread" || n == "NtSetInformationToken" ||
+            n == "NtSetInformationJobObject" || n == "NtSetInformationFile" || n == "NtSetInformationObject" )
+        {
+            set_information( n, host_handle( a0 ), static_cast< ULONG >( a1 ), a2, static_cast< ULONG >( a3 ) );
+            return;
         }
         if ( n == "NtOpenFile" )
         {
@@ -702,68 +952,105 @@ namespace
             catch ( ... ) {}
             result( object_name_not_found ); return;
         }
-        if ( n == "NtQueryInformationProcess" )
-        {
-            std::printf( "offline: NtQueryInformationProcess class %llu len %llu\n",
-                static_cast< unsigned long long >( a1 ), static_cast< unsigned long long >( a3 ) );
-            std::fflush( stdout );
-            const auto return_length = argument( 4 );
-            if ( return_length && !accessible( return_length, 4 ) ) { result( access_violation ); return; }
-            const auto required = a1 == 0 ? 48u : ( a1 == 7 || a1 == 0x1a || a1 == 0x1e ) ? 8u :
-                ( a1 == 0x1f || a1 == 12 ) ? 4u : 0u;
-            if ( !required ) { result( 0xc0000003u ); return; }
-            if ( a2 & ( ( required == 4 ? 4ull : 8ull ) - 1 ) ) { result( 0x80000002u ); return; }
-            if ( a3 < required ) { if ( return_length ) w32( return_length, required ); result( info_length_mismatch ); return; }
-            if ( !accessible( a2, required ) ) { result( access_violation ); return; }
-            if ( a1 == 7 ) w64( a2, 0 );
-            else if ( a1 == 0x1f ) w32( a2, 1 );
-            else if ( a1 == 12 ) w32( a2, 1 );
-            else if ( a1 == 0x1a ) w64( a2, 0 );
-            else if ( a1 == 0x1e )
-            {
-                w64( a2, 0 ); if ( return_length ) w32( return_length, required ); result( port_not_set ); return;
-            }
-            else if ( a1 == 0 && a3 >= 16 )
-            {
-                zero( a2, static_cast< std::size_t >( a3 ) ); w64( a2 + 8, peb );
-                if ( a3 >= 48 ) { w64( a2 + 32, 0x1234 ); w64( a2 + 40, 0x1111 ); }
-            }
-            else throw std::runtime_error( "unsupported process information class " + std::to_string( a1 ) );
-            if ( return_length ) w32( return_length, required ); result( success ); return;
-        }
         if ( n == "NtCreateDebugObject" )
         {
             if ( !accessible( a0, 8 ) ) { result( access_violation ); return; }
             auto handle = 0x100ull + handles.size( ); handles[ handle ] = 0; w64( a0, handle ); result( success ); return;
         }
-        if ( n == "NtQueryObject" && a1 == 2 )
+        if ( n == "NtQuerySystemInformation" || n == "NtQuerySystemInformationEx" || n == "RtlGetNativeSystemInformation" )
         {
-            const auto return_length = argument( 4 );
-            if ( return_length && accessible( return_length, 4 ) ) w32( return_length, 0x80 );
-            if ( a3 < 0x80 ) { result( info_length_mismatch ); return; }
-            if ( !accessible( a2, 0x80 ) ) { result( access_violation ); return; }
-            zero( a2, 0x80 ); const std::string kind = "DebugObject";
-            write< std::uint16_t >( a2, static_cast< std::uint16_t >( kind.size( ) * 2 ) );
-            write< std::uint16_t >( a2 + 2, static_cast< std::uint16_t >( kind.size( ) * 2 + 2 ) ); w64( a2 + 8, a2 + 0x68 );
-            for ( unsigned i = 0; i <= kind.size( ); ++i ) write< std::uint16_t >( a2 + 0x68 + i * 2, i == kind.size( ) ? 0 : kind[ i ] );
-            w32( a2 + 0x10, 1 ); w32( a2 + 0x14, 1 ); result( success ); return;
-        }
-        if ( n == "NtSetInformationThread" && a1 == 0x11 )
-        {
-            if ( a3 ) result( info_length_mismatch );
-            else if ( a0 != ~std::uint64_t( 1 ) ) result( invalid_handle );
-            else { hidden = true; result( success ); }
+            const auto cls = a0;
+            const auto buf = a1;
+            const auto len = a2;
+            const auto retlen = a3;
+            auto need = 0u;
+            if ( cls == 0 || cls == 0x3e || cls == 0x72 ) need = 0x40;
+            else if ( cls == 2 ) need = 0x138;
+            else if ( cls == 3 ) need = 0x30;
+            else if ( cls == 0x0b ) need = 0x128;
+            else if ( cls == 0x23 ) need = 2;
+            else if ( cls == 0x32 ) need = 8;
+            else if ( cls == 0x5a ) need = 8;
+            else
+            {
+                if ( retlen && accessible( retlen, 4 ) ) w32( retlen, 0 );
+                result( 0xc0000003u );
+                return;
+            }
+            if ( retlen && !accessible( retlen, 4 ) ) { result( access_violation ); return; }
+            if ( len < need )
+            {
+                if ( retlen ) w32( retlen, need );
+                result( info_length_mismatch );
+                return;
+            }
+            if ( !accessible( buf, need ) ) { result( access_violation ); return; }
+            zero( buf, need );
+            if ( cls == 0 || cls == 0x3e || cls == 0x72 )
+            {
+                w32( buf + 0x04, 156250 );
+                w32( buf + 0x08, 0x1000 );
+                w32( buf + 0x0c, 0x200000 );
+                w32( buf + 0x10, 1 );
+                w32( buf + 0x14, 0x1fffff );
+                w32( buf + 0x18, 0x10000 );
+                w64( buf + 0x20, 0x10000 );
+                w64( buf + 0x28, 0x00007ffffffeffffull );
+                w64( buf + 0x30, 1 );
+                write< std::uint8_t >( buf + 0x38, 1 );
+            }
+            else if ( cls == 2 )
+            {
+                w64( buf, ticks );
+            }
+            else if ( cls == 3 )
+            {
+                w64( buf, ticks );
+                w64( buf + 8, 0x01d0000000000000ull );
+            }
+            else if ( cls == 0x0b )
+            {
+                w32( buf, 1 );
+                w64( buf + 0x08, 0xfffff80000000000ull );
+                w64( buf + 0x10, 0xfffff80000000000ull );
+                w32( buf + 0x18, 0x800000 );
+                w32( buf + 0x1c, 0 );
+                write< std::uint16_t >( buf + 0x20, 0 );
+                write< std::uint16_t >( buf + 0x22, 0 );
+                write< std::uint16_t >( buf + 0x24, 0 );
+                write< std::uint16_t >( buf + 0x26, 0x18 );
+                const char path[] = "\\SystemRoot\\system32\\ntoskrnl.exe";
+                for ( unsigned i = 0; i < sizeof( path ); ++i )
+                    write< std::uint8_t >( buf + 0x28 + i, static_cast< std::uint8_t >( path[ i ] ) );
+            }
+            else if ( cls == 0x23 )
+            {
+                write< std::uint8_t >( buf, 0 );
+                write< std::uint8_t >( buf + 1, 1 );
+            }
+            else if ( cls == 0x32 || cls == 0x5a )
+            {
+                w64( buf, 0xffff800000000000ull );
+            }
+            if ( retlen ) w32( retlen, need );
+            result( success );
             return;
         }
-        if ( n == "NtQueryInformationThread" && a1 == 0x11 )
+        if ( n == "GetSystemInfo" || n == "GetNativeSystemInfo" )
         {
-            if ( a3 < 1 || !accessible( a2, 1 ) ) { result( info_length_mismatch ); return; }
-            write< std::uint8_t >( a2, hidden ? 1 : 0 ); result( success ); return;
-        }
-        if ( n == "NtQuerySystemInformation" && a0 == 0x23 )
-        {
-            if ( a2 < 2 || !accessible( a1, 2 ) ) { result( info_length_mismatch ); return; }
-            write< std::uint8_t >( a1, 0 ); write< std::uint8_t >( a1 + 1, 1 ); if ( a3 && accessible( a3, 4 ) ) w32( a3, 2 ); result( success ); return;
+            if ( !accessible( a0, 48 ) ) { result( 0 ); return; }
+            zero( a0, 48 );
+            write< std::uint16_t >( a0, 9 );
+            w32( a0 + 4, 0x1000 );
+            w64( a0 + 8, 0x10000 );
+            w64( a0 + 16, 0x00007ffffffeffffull );
+            w64( a0 + 24, 1 );
+            w32( a0 + 32, 1 );
+            w32( a0 + 36, 2 );
+            write< std::uint16_t >( a0 + 40, 6 );
+            write< std::uint16_t >( a0 + 42, 0x8e0a );
+            result( 0 );
+            return;
         }
         if ( n == "QueryPerformanceCounter" || n == "QueryPerformanceFrequency" )
         {
@@ -848,7 +1135,26 @@ namespace
             result( 0x80004001ull ); return;
         }
 
-        throw std::runtime_error( "unsupported offline API " + n );
+        if ( n.rfind( "Nt", 0 ) == 0 || n.rfind( "Zw", 0 ) == 0 || n.rfind( "Rtl", 0 ) == 0 )
+        {
+            if ( n.find( "Query" ) != std::string::npos && n.find( "Information" ) != std::string::npos )
+            {
+                query_information( n, host_handle( a0 ), static_cast< ULONG >( a1 ), a2, static_cast< ULONG >( a3 ), argument( 4 ) );
+                return;
+            }
+            if ( n.find( "Set" ) != std::string::npos && n.find( "Information" ) != std::string::npos )
+            {
+                set_information( n, host_handle( a0 ), static_cast< ULONG >( a1 ), a2, static_cast< ULONG >( a3 ) );
+                return;
+            }
+            std::printf( "offline: stub %s -> STATUS_SUCCESS\n", n.c_str( ) );
+            std::fflush( stdout );
+            result( success );
+            return;
+        }
+        std::printf( "offline: stub win32 %s -> TRUE\n", n.c_str( ) );
+        std::fflush( stdout );
+        result( 1 );
     }
 
     auto loader::block( std::uint64_t address, std::uint32_t size ) -> void
@@ -999,7 +1305,7 @@ namespace
                     std::string symbol;
                     if ( IMAGE_SNAP_BY_ORDINAL64( thunk ) ) symbol = "#" + std::to_string( IMAGE_ORDINAL64( thunk ) );
                     else symbol = string_at( image, thunk + 2 );
-                    w64( p.base + iat_rva, resolve( module, symbol ) );
+                    w64( p.base + iat_rva, resolve( module, symbol, 0, nullptr, "image.exe" ) );
                 }
             }
         }
